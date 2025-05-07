@@ -1,0 +1,607 @@
+\documentclass[8pt]{article}
+\usepackage[UTF8]{ctex} 
+\usepackage{amsmath}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{hyperref}
+\usepackage{graphicx}
+\usepackage{geometry}
+
+\usepackage{listings}
+\usepackage{xcolor}
+\lstset{
+    basicstyle=\ttfamily\footnotesize,
+    keywordstyle=\color{blue},
+    commentstyle=\color{gray},
+    stringstyle=\color{orange},
+    showstringspaces=false,
+    numberstyle=\tiny\color{gray},
+    numbers=left,
+    breaklines=true,
+    frame=single,
+    captionpos=b
+}
+
+
+\geometry{a4paper, margin=3cm}
+\title{计算练习：物理信息神经网络 (PINNs)}
+\author{姜早}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\section{概述}
+在本练习中，将使用前馈网络求解非线性扩散-对流-反应方程。该练习旨在帮助理解和应用物理信息神经网络 (PINNs) 解决实际问题。
+\section{问题描述}
+求解以下偏微分方程：
+\begin{equation}
+Lu \equiv u''(x) - Pe \cdot u'(x) + Da \cdot u(1 - u) = 0, \quad x \in (0, 1)
+\end{equation}
+边界条件为：
+\begin{equation}
+u(0) = 0,\quad u(1) = 1
+\end{equation}
+其中，$Pe$ 和 $Da$ 是两个无量纲化的物理参数：
+\begin{itemize}
+    \item $Pe$ 是描述对流相对扩散强度的Peclet数
+    \item $Da$ 是描述反应相对扩散强度的Damkohler数
+\end{itemize}
+
+\section{方法实现}
+为了方便调试参数和代码复用，我将整个训练网络分成了几个部分，分别为超参数设置，模型搭建，模型训练，结果绘制四个模块，最终由主函数调用它们来完成我们需要的全部功能。这些模块的具体实现分别为config.py，models.py, training.py, graphplot.py和main.py，接下来我们逐个介绍。
+
+\subsection{初始参数设置}
+\par 首先是超参数设置模块。在config.py中，我们使用python自带的字典结构来存储设备，网络，训练以及物理问题相关的超参数，方便之后的调试和修改。以下是它的伪代码,具体python代码见附件。
+\begin{algorithm}[H]
+    \caption{存储超参数}
+    \begin{algorithmic}[1]
+    \State 变量device指示计算设备为\texttt{cuda}，若不可用则指向\texttt{cpu}
+    \Statex
+    \State \textbf{网络参数}：
+    \State \quad 输入维度 $= 1$
+    \State \quad 输出维度 $= 1$
+    \State \quad 隐藏层宽度 $= 18$
+    \State \quad 网络深度（隐藏层数）$= 6$
+    \State \quad 激活函数 $= \tanh$
+    \State \quad 正态分布方差 $= 1.0$
+    \State \quad L2 正则化系数 $= 1 \times 10^{-7}$
+    \Statex
+    \State \textbf{训练参数}：
+    \State \quad 学习率 $= 1 \times 10^{-4}$
+    \State \quad 最大训练轮数 $= 40000$
+    \State \quad 边界损失权重集合 $\lambda_b = \{10, 300, 10000\}$
+    \State \quad 每个区域采样点数 $= 100$
+    \Statex
+    \State \textbf{问题物理参数}：
+    \State \quad Case 1: Pe $= 0.01$, Da $= 0.01$ （扩散主导）
+    \State \quad Case 2: Pe $= 20.0$, Da $= 0.01$ （对流主导）
+    \State \quad Case 3: Pe $= 0.01$, Da $= 60.0$ （反应主导）
+    \end{algorithmic}
+    \end{algorithm}
+\subsection{神经网络模型}
+第二步构建网络，该模块实现基本的MLP模型和初始化。它具有6层全连接网络，其中隐藏层宽度为18。并且该神经网络满足：
+\begin{enumerate}
+    \item 使用标准正态分布初始化参数；
+    \item 除了输出层以外，使用tanh激活函数；
+    \item 使用L2正则化，系数为1e-7。
+\end{enumerate}
+\par 需要说明的是，除了标准正态分布以外，我后来在求解的过程中尝试了些别的初始化分布，比如常数点分布，和均匀分布。另外，对于L2正则化的实现，因为pytorch的优化器如“optim.Adam”方法中设置了weight\_decay参数，传入参数给它可以帮助我们直接对各层进行对应参数的L2正则化，所以我没有显式地将正则化的loss加入到总的loss计算中；
+\par 作为PDE求解器，该网络通过自动微分将物理方程约束嵌入损失函数，实现无需监督数据的物理规律学习。代码支持GPU加速并保留计算图以进行高阶导数计算。算法的代码结构如下所示：
+\begin{algorithm}[H]
+\caption{PINN 神经网络模型初始化(models.py)}
+\begin{algorithmic}[2]
+\State 输入：接受config.py文件，得到输入维度 $d_{in}$，输出维度 $d_{out}$，隐藏层宽度 $w$，深度 $L$，激活函数 $\sigma$，正态分布初始化的标准差 $\sigma_w$
+\State 网络层列表layers初始化为空列表
+\State 添加输入层：nn.Linear($d_{in}$, $w$)
+\For{$\ell = 1$ to $L-1$}
+    \State 添加隐藏层：nn.Linear($w$, $w$)
+\EndFor
+\State 添加输出层：nn.Linear($w$, $d_{out}$)
+\For{每一层 layer}
+    \State 权重初始化：nn.init.Normal\_(layer.weight, mean = 0, std =$\sigma_w$)(可以换成uniform\_)
+    \State 偏置初始化：nn.init.Normal\_(layer.bias, mean = 0, std =  $\sigma_w$)(可以换成uniform\_)
+\EndFor
+\State 激活函数设为 $\sigma$ （当前仅支持 $\tanh$）
+\Function{Forward}{$x$}
+    \For{除输出层以外，每一层 layer do}
+        \State $x \gets \sigma(\text{layer}(x))$
+    \EndFor
+    \State 输出层不加激活：$x \gets \text{layer}(x)$
+    \State \Return $x$
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+    
+\subsection{模型训练和损失函数计算}
+接下来是主要的训练环节。首先需要给出计算loss的函数，我们定义损失函数为
+\begin{equation}
+\mathcal{L} = \mathcal{L}_{int} + \lambda_b \mathcal{L}_{bc}
+\end{equation}
+其中：
+\begin{equation}
+\mathcal{L}_{int} = \frac{1}{N}\sum_{i=1}^N \left|u''(x_i) - Pe \cdot u'(x_i) + Da \cdot u(x_i)(1 - u(x_i))\right|^2
+\end{equation}
+\begin{equation}
+\mathcal{L}_{bc} = |u(0)|^2 + |u(1) - 1|^2
+\end{equation}
+\par 对应loss函数的计算我们就不给出伪代码，因为作业的文档中已经给出了提示。计算完loss函数后就可以进行正常的反向传播优化了，此时唯一需要注意的事情是在梯度下降之前记录内部的损失~$\mathcal{L}_{int}$和边界的损失~$\mathcal{L}_{bc}$，用以在训练结束后进行绘图。因为训练结束就代表已经得到了绘制loss下降过程的全部信息了，所以我将用于loss曲线绘制的plot\_losses函数写在这里training.py中，在所有的训练epoch结束后直接使用保存的数据进行绘图就行，然后保存到给定文件夹中，注意我们绘制的是y轴为log scale的图像。伪代码如下：
+\begin{algorithm}[H]
+    \caption{训练 PINN 网络的主流程（train\_model 函数）}
+    \begin{algorithmic}[3]
+    \Require 输入参数 $Pe$, $Da$, 边界损失权重 $\lambda_b$
+    \State 从config.py文件获得训练的最大epoch数，和训练时的采样点数N。（epochs=40000, N=100）
+    \State 实例化 PINN 模型 $\mathcal{N}_{\theta}$，并转移至设备（GPU/CPU）
+    \State 实例化 Adam 优化器，设置学习率和 L2 正则化系数（1e-7）
+    \State 生成训练点 $x_i \in [0, 1]$ 共 $N$ 个
+    \State 初始化损失记录列表：$R_{\text{int}}$, $R_{\text{bc}}$, $\mathcal{L}_{\text{total}}$
+    
+    \For{epoch = 1 \textbf{to} 最大的epoch数}
+        \State 清除优化器梯度
+        \State 计算损失 $\mathcal{L}_{\text{total}} = R_{\text{int}} + \lambda_b R_{\text{bc}}$
+        \State 反向传播
+        \State 优化器执行一步更新
+        \State 记录当前的 $R_{\text{int}}, R_{\text{bc}}, \mathcal{L}_{\text{total}}$
+        \If{epoch 可被 1000 整除}
+            \State 打印当前训练进度与损失值
+        \EndIf
+    \EndFor
+    
+    \If{提供了保存路径}
+        \State 保存损失曲线图像至指定目录
+    \EndIf
+    \State \Return 训练后的模型和损失历史用于在main函数中保存
+    \end{algorithmic}
+\end{algorithm}
+\subsection{结果图绘制}
+该部分通过传入模型，模型采样点，对应的物理方程中的参数和图像保存路径，实现求解结果的绘图和保存图像的功能，我们省略它的伪代码，具体实现代码见附件graphplot.py。
+\newpage
+\section{实验结果和初步分析}
+训练求解了三组不同参数值对应的方程，参数分别为
+\begin{itemize}
+    \item $Pe = 0.01, Da = 0.01$（扩散占主导）
+    \item $Pe = 20, Da = 0.01$（对流占主导）
+    \item $Pe = 0.01, Da = 60$（反应占主导）.
+\end{itemize}
+接下来我将在这一节中展示我的实验结果。首先我给出按照作业要求的参数画出来的结果。
+\par 考虑到训练的随机性，我对每组方程参数，保持相同的训练超参数的情况下训练了两次，仅展示训练得比较好的一次。
+\subsection{第一组训练结果:}
+\begin{figure}[H]
+\centering
+\begin{subfigure}{0.32\textwidth}
+    \includegraphics[width=\linewidth]{resultsL2NormalAgain/solutions/solution_Pe0.01_Da0.01_lb10.png}
+    \caption{\footnotesize 扩散主导 ($Pe=0.01, Da=0.01$) }
+    \label{fig:sol_diff}
+\end{subfigure}
+\hfill
+\begin{subfigure}{0.32\textwidth}
+    \includegraphics[width=\linewidth]{resultsL2NormalAgain/solutions/solution_Pe20.0_Da0.01_lb10.png}
+    \caption{\footnotesize 对流主导 ($Pe=20, Da=0.01$)}
+    \label{fig:sol_conv}
+\end{subfigure}
+\hfill
+\begin{subfigure}{0.32\textwidth}
+    \includegraphics[width=\linewidth]{resultsL2NormalAgain/solutions/solution_Pe0.01_Da60.0_lb10.png}
+    \caption{\footnotesize 反应主导 ($Pe=0.01, Da=60$)}
+    \label{fig:sol_react}
+\end{subfigure}
+\caption{\footnotesize 不同参数下的解曲线 ($\lambda_b=10$)}
+\label{fig:sols}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\begin{subfigure}{0.32\textwidth}
+    \includegraphics[width=\linewidth]{resultsL2NormalAgain/losses/losses_Pe0.01_Da0.01_lb10.png}
+    \caption{\footnotesize 扩散主导}
+    \label{fig:loss_diff}
+\end{subfigure}
+\hfill
+\begin{subfigure}{0.32\textwidth}
+    \includegraphics[width=\linewidth]{resultsL2NormalAgain/losses/losses_Pe20.0_Da0.01_lb10.png}
+    \caption{\footnotesize 对流主导}
+    \label{fig:loss_conv}
+\end{subfigure}
+\hfill
+\begin{subfigure}{0.32\textwidth}
+    \includegraphics[width=\linewidth]{resultsL2NormalAgain/losses/losses_Pe0.01_Da60.0_lb10.png}
+    \caption{\footnotesize 反应主导}
+    \label{fig:loss_react}
+\end{subfigure}
+\caption{\footnotesize 不同参数下的loss下降曲线 ($\lambda_b=10$)}
+\label{fig:losses}
+\end{figure}
+
+可以看到,在这种情况下,对流主导的方程的loss函数难以下降到足够小的值,函数图像并不可信。此时它真正的解函数图像还待我们进一步测试。接下来增大~$\lambda_b$，我们来观察会发生什么事情。
+\subsection{第二组训练结果：}
+\begin{figure}[H]
+    \centering
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\linewidth]{resultsL2NormalAgain/solutions/solution_Pe0.01_Da0.01_lb300.png}
+        \caption{\footnotesize 扩散主导 ($Pe=0.01, Da=0.01$) }
+        \label{fig:sol_diff300}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\linewidth]{resultsL2NormalAgain/solutions/solution_Pe20.0_Da0.01_lb300.png}
+        \caption{\footnotesize 对流主导 ($Pe=20, Da=0.01$)}
+        \label{fig:sol_conv300}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\linewidth]{resultsL2NormalAgain/solutions/solution_Pe0.01_Da60.0_lb300.png}
+        \caption{\footnotesize 反应主导 ($Pe=0.01, Da=60$)}
+        \label{fig:sol_react300}
+    \end{subfigure}
+    \caption{\footnotesize 不同参数下的解曲线 ($\lambda_b=300$)}
+    \label{fig:sols300}
+    \end{figure}
+    
+    \begin{figure}[H]
+    \centering
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\linewidth]{resultsL2NormalAgain/losses/losses_Pe0.01_Da0.01_lb300.png}
+        \caption{\footnotesize 扩散主导}
+        \label{fig:loss_diff300}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\linewidth]{resultsL2NormalAgain/losses/losses_Pe20.0_Da0.01_lb300.png}
+        \caption{\footnotesize 对流主导}
+        \label{fig:loss_conv300}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\linewidth]{resultsL2NormalAgain/losses/losses_Pe0.01_Da60.0_lb300.png}
+        \caption{\footnotesize 反应主导}
+        \label{fig:loss_react300}
+    \end{subfigure}
+    \caption{\footnotesize 不同参数下的loss下降曲线 ($\lambda_b=300$)}
+    \label{fig:losses300}
+\end{figure}
+可以看到此时对流主导的方程的求解得到了很好的收敛，但是反应主导的方程却产生了麻烦。我们再增大~$\lambda=10000$看看发生了什么。
+\subsection{第三组训练结果：}
+\begin{figure}[H]
+    \centering
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\linewidth]{resultsL2NormalAgain/solutions/solution_Pe0.01_Da0.01_lb10000.png}
+        \caption{\footnotesize 扩散主导 ($Pe=0.01, Da=0.01$) }
+        \label{fig:sol_diff10000}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\linewidth]{resultsL2NormalAgain/solutions/solution_Pe20.0_Da0.01_lb10000.png}
+        \caption{\footnotesize 对流主导 ($Pe=20, Da=0.01$)}
+        \label{fig:sol_conv10000}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\linewidth]{resultsL2NormalAgain/solutions/solution_Pe0.01_Da60.0_lb10000.png}
+        \caption{\footnotesize 反应主导 ($Pe=0.01, Da=60$)}
+        \label{fig:sol_react10000}
+    \end{subfigure}
+    \caption{\footnotesize 不同参数下的解曲线 ($\lambda_b=10000$)}
+    \label{fig:sols10000}
+    \end{figure}
+    
+    \begin{figure}[H]
+    \centering
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\linewidth]{resultsL2NormalAgain/losses/losses_Pe0.01_Da0.01_lb10000.png}
+        \caption{\footnotesize 扩散主导}
+        \label{fig:loss_diff10000}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\linewidth]{resultsL2NormalAgain/losses/losses_Pe20.0_Da0.01_lb10000.png}
+        \caption{\footnotesize 对流主导}
+        \label{fig:loss_conv10000}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\linewidth]{resultsL2NormalAgain/losses/losses_Pe0.01_Da60.0_lb10000.png}
+        \caption{\footnotesize 反应主导}
+        \label{fig:loss_react10000}
+    \end{subfigure}
+    \caption{\footnotesize 不同参数下的loss下降曲线 ($\lambda_b=10000$)}
+    \label{fig:losses10000}
+\end{figure}
+我们可以看到，此时对流主导的方程得到了很好的收敛，但是扩散主导和反应主导的方程却都不收敛了。由此我们初步断定，也许在边界权重~$\lambda_b$较大时，对流主导的方程的求解更容易收敛，在边界权重较小时，扩散主导的方程求解更容易收敛，而反应主导的方程可能是最难收敛的，因为它在两种~$\lambda_b$的取值下都没有收敛。
+\section{进一步的分析与讨论}
+我们初步得到该方程的解的函数图像的大该样子，扩散主导的方程的解形如线性函数，对流方程的解形如指数函数，而反应主导的方程的解形如对数函数。并且还有一些结论，如下
+\begin{itemize}
+    \item 反应主导情况($Da=60$)最难求解
+    \item 边界条件权重$\lambda_b$需要根据不同情况调整：
+    \begin{itemize}
+        \item 扩散主导: $\lambda_b=10$足够
+        \item 对流主导: 需要更高$\lambda_b$（如300）
+    \end{itemize}
+\end{itemize}
+但是我最开始写代码的时候，忘记了加上l2正则化的条件，阴差阳错得到了一个较差的结果，但是它也印证了我们反应主导的方程(Pe=0.01, Da=60)是最难求解的猜想。它的结果为
+\subsection{第一组训练结果:}
+\begin{figure}[H]
+\centering
+\begin{subfigure}{0.32\textwidth}
+    \includegraphics[width=\linewidth]{resultsL2Normal/solutions/solution_Pe0.01_Da0.01_lb10.png}
+    \caption{\footnotesize 扩散主导 ($Pe=0.01, Da=0.01$) }
+    \label{fig:sol_diff1}
+\end{subfigure}
+\hfill
+\begin{subfigure}{0.32\textwidth}
+    \includegraphics[width=\linewidth]{resultsL2Normal/solutions/solution_Pe20.0_Da0.01_lb10.png}
+    \caption{\footnotesize 对流主导 ($Pe=20, Da=0.01$)}
+    \label{fig:sol_conv1}
+\end{subfigure}
+\hfill
+\begin{subfigure}{0.32\textwidth}
+    \includegraphics[width=\linewidth]{resultsL2Normal/solutions/solution_Pe0.01_Da60.0_lb10.png}
+    \caption{\footnotesize 反应主导 ($Pe=0.01, Da=60$)}
+    \label{fig:sol_react1}
+\end{subfigure}
+\caption{\footnotesize 不同参数下的解曲线 ($\lambda_b=10$)}
+\label{fig:sols1}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\begin{subfigure}{0.32\textwidth}
+    \includegraphics[width=\linewidth]{resultsL2Normal/losses/losses_Pe0.01_Da0.01_lb10.png}
+    \caption{\footnotesize 扩散主导}
+    \label{fig:loss_diff1}
+\end{subfigure}
+\hfill
+\begin{subfigure}{0.32\textwidth}
+    \includegraphics[width=\linewidth]{resultsL2Normal/losses/losses_Pe20.0_Da0.01_lb10.png}
+    \caption{\footnotesize 对流主导}
+    \label{fig:loss_conv1}
+\end{subfigure}
+\hfill
+\begin{subfigure}{0.32\textwidth}
+    \includegraphics[width=\linewidth]{resultsL2Normal/losses/losses_Pe0.01_Da60.0_lb10.png}
+    \caption{\footnotesize 反应主导}
+    \label{fig:loss_react1}
+\end{subfigure}
+\caption{\footnotesize 不同参数下的loss下降曲线 ($\lambda_b=10$)}
+\label{fig:losses1}
+\end{figure}
+\subsection{第二组训练结果：}
+\begin{figure}[H]
+    \centering
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\linewidth]{resultsL2Normal/solutions/solution_Pe0.01_Da0.01_lb300.png}
+        \caption{\footnotesize 扩散主导 ($Pe=0.01, Da=0.01$) }
+        \label{fig:1sol_diff300}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\linewidth]{resultsL2Normal/solutions/solution_Pe20.0_Da0.01_lb300.png}
+        \caption{\footnotesize 对流主导 ($Pe=20, Da=0.01$)}
+        \label{fig:1sol_conv300}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\linewidth]{resultsL2Normal/solutions/solution_Pe0.01_Da60.0_lb300.png}
+        \caption{\footnotesize 反应主导 ($Pe=0.01, Da=60$)}
+        \label{fig:1sol_react300}
+    \end{subfigure}
+    \caption{\footnotesize 不同参数下的解曲线 ($\lambda_b=300$)}
+    \label{fig:1sols300}
+    \end{figure}
+    
+    \begin{figure}[H]
+    \centering
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\linewidth]{resultsL2Normal/losses/losses_Pe0.01_Da0.01_lb300.png}
+        \caption{\footnotesize 扩散主导}
+        \label{fig:1loss_diff300}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\linewidth]{resultsL2Normal/losses/losses_Pe20.0_Da0.01_lb300.png}
+        \caption{\footnotesize 对流主导}
+        \label{fig:1loss_conv300}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\linewidth]{resultsL2Normal/losses/losses_Pe0.01_Da60.0_lb300.png}
+        \caption{\footnotesize 反应主导}
+        \label{fig:1loss_react300}
+    \end{subfigure}
+    \caption{\footnotesize 不同参数下的loss下降曲线 ($\lambda_b=300$)}
+    \label{fig:1losses300}
+\end{figure}
+\subsection{第三组训练结果：}
+\begin{figure}[H]
+    \centering
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\linewidth]{resultsL2Normal/solutions/solution_Pe0.01_Da0.01_lb10000.png}
+        \caption{\footnotesize 扩散主导 ($Pe=0.01, Da=0.01$) }
+        \label{fig:1sol_diff10000}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\linewidth]{resultsL2Normal/solutions/solution_Pe20.0_Da0.01_lb10000.png}
+        \caption{\footnotesize 对流主导 ($Pe=20, Da=0.01$)}
+        \label{fig:1sol_conv10000}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\linewidth]{resultsL2Normal/solutions/solution_Pe0.01_Da60.0_lb10000.png}
+        \caption{\footnotesize 反应主导 ($Pe=0.01, Da=60$)}
+        \label{fig:1sol_react10000}
+    \end{subfigure}
+    \caption{\footnotesize 不同参数下的解曲线 ($\lambda_b=10000$)}
+    \label{fig:1sols10000}
+    \end{figure}
+    
+    \begin{figure}[H]
+    \centering
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\linewidth]{resultsL2Normal/losses/losses_Pe0.01_Da0.01_lb10000.png}
+        \caption{\footnotesize 扩散主导}
+        \label{fig:1loss_diff10000}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\linewidth]{resultsL2Normal/losses/losses_Pe20.0_Da0.01_lb10000.png}
+        \caption{\footnotesize 对流主导}
+        \label{fig:1loss_conv10000}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\linewidth]{resultsL2Normal/losses/losses_Pe0.01_Da60.0_lb10000.png}
+        \caption{\footnotesize 反应主导}
+        \label{fig:1loss_react10000}
+    \end{subfigure}
+    \caption{\footnotesize 不同参数下的loss下降曲线 ($\lambda_b=10000$)}
+    \label{fig:1losses10000}
+\end{figure}
+可以看到基本上所有的反应主导的方程都没有正确求解，这也说明了它可能是最难求解的。
+最后，我想给出一个我自己尝试的，对偏置项和权重项初始化的分布使用均匀分布的结果（仍然对每一层进行l2正则化），此时我发现这个方程在不同的参数下，不同的~$\lambda_b$下都得到了很好的收敛。它们的代码和最初的代码唯一的区别仅仅是在models.py中将初始化处的nn.init.normal\_方法改为使用nn.init.uniform\_方法。
+\subsection{第一组训练结果:}
+\begin{figure}[H]
+\centering
+\begin{subfigure}{0.32\textwidth}
+    \includegraphics[width=\linewidth]{resultsL2Uniform/solutions/solution_Pe0.01_Da0.01_lb10.png}
+    \caption{\footnotesize 扩散主导 ($Pe=0.01, Da=0.01$) }
+    \label{fig:sol_diff2}
+\end{subfigure}
+\hfill
+\begin{subfigure}{0.32\textwidth}
+    \includegraphics[width=\linewidth]{resultsL2Uniform/solutions/solution_Pe20.0_Da0.01_lb10.png}
+    \caption{\footnotesize 对流主导 ($Pe=20, Da=0.01$)}
+    \label{fig:sol_conv2}
+\end{subfigure}
+\hfill
+\begin{subfigure}{0.32\textwidth}
+    \includegraphics[width=\linewidth]{resultsL2Uniform/solutions/solution_Pe0.01_Da60.0_lb10.png}
+    \caption{\footnotesize 反应主导 ($Pe=0.01, Da=60$)}
+    \label{fig:sol_react2}
+\end{subfigure}
+\caption{\footnotesize 不同参数下的解曲线 ($\lambda_b=10$)}
+\label{fig:sols2}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\begin{subfigure}{0.32\textwidth}
+    \includegraphics[width=\linewidth]{resultsL2Uniform/losses/losses_Pe0.01_Da0.01_lb10.png}
+    \caption{\footnotesize 扩散主导}
+    \label{fig:loss_diff2}
+\end{subfigure}
+\hfill
+\begin{subfigure}{0.32\textwidth}
+    \includegraphics[width=\linewidth]{resultsL2Uniform/losses/losses_Pe20.0_Da0.01_lb10.png}
+    \caption{\footnotesize 对流主导}
+    \label{fig:loss_conv2}
+\end{subfigure}
+\hfill
+\begin{subfigure}{0.32\textwidth}
+    \includegraphics[width=\linewidth]{resultsL2Uniform/losses/losses_Pe0.01_Da60.0_lb10.png}
+    \caption{\footnotesize 反应主导}
+    \label{fig:loss_react2}
+\end{subfigure}
+\caption{\footnotesize 不同参数下的loss下降曲线 ($\lambda_b=10$)}
+\label{fig:losses2}
+\end{figure}
+\subsection{第二组训练结果：}
+\begin{figure}[H]
+    \centering
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\linewidth]{resultsL2Uniform/solutions/solution_Pe0.01_Da0.01_lb300.png}
+        \caption{\footnotesize 扩散主导 ($Pe=0.01, Da=0.01$) }
+        \label{fig:2sol_diff300}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\linewidth]{resultsL2Uniform/solutions/solution_Pe20.0_Da0.01_lb300.png}
+        \caption{\footnotesize 对流主导 ($Pe=20, Da=0.01$)}
+        \label{fig:2sol_conv300}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\linewidth]{resultsL2Uniform/solutions/solution_Pe0.01_Da60.0_lb300.png}
+        \caption{\footnotesize 反应主导 ($Pe=0.01, Da=60$)}
+        \label{fig:2sol_react300}
+    \end{subfigure}
+    \caption{\footnotesize 不同参数下的解曲线 ($\lambda_b=300$)}
+    \label{fig:2sols300}
+    \end{figure}
+    
+    \begin{figure}[H]
+    \centering
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\linewidth]{resultsL2Uniform/losses/losses_Pe0.01_Da0.01_lb300.png}
+        \caption{\footnotesize 扩散主导}
+        \label{fig:2loss_diff300}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\linewidth]{resultsL2Uniform/losses/losses_Pe20.0_Da0.01_lb300.png}
+        \caption{\footnotesize 对流主导}
+        \label{fig:2loss_conv300}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\linewidth]{resultsL2Uniform/losses/losses_Pe0.01_Da60.0_lb300.png}
+        \caption{\footnotesize 反应主导}
+        \label{fig:2loss_react300}
+    \end{subfigure}
+    \caption{\footnotesize 不同参数下的loss下降曲线 ($\lambda_b=300$)}
+    \label{fig:2losses300}
+\end{figure}
+\subsection{第三组训练结果：}
+\begin{figure}[H]
+    \centering
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\linewidth]{resultsL2Uniform/solutions/solution_Pe0.01_Da0.01_lb10000.png}
+        \caption{\footnotesize 扩散主导 ($Pe=0.01, Da=0.01$) }
+        \label{fig:2sol_diff10000}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\linewidth]{resultsL2Uniform/solutions/solution_Pe20.0_Da0.01_lb10000.png}
+        \caption{\footnotesize 对流主导 ($Pe=20, Da=0.01$)}
+        \label{fig:2sol_conv10000}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\linewidth]{resultsL2Uniform/solutions/solution_Pe0.01_Da60.0_lb10000.png}
+        \caption{\footnotesize 反应主导 ($Pe=0.01, Da=60$)}
+        \label{fig:2sol_react10000}
+    \end{subfigure}
+    \caption{\footnotesize 不同参数下的解曲线 ($\lambda_b=10000$)}
+    \label{fig:2sols10000}
+    \end{figure}
+    
+    \begin{figure}[H]
+    \centering
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\linewidth]{resultsL2Uniform/losses/losses_Pe0.01_Da0.01_lb10000.png}
+        \caption{\footnotesize 扩散主导}
+        \label{fig:2loss_diff10000}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\linewidth]{resultsL2Uniform/losses/losses_Pe20.0_Da0.01_lb10000.png}
+        \caption{\footnotesize 对流主导}
+        \label{fig:2loss_conv10000}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\linewidth]{resultsL2Uniform/losses/losses_Pe0.01_Da60.0_lb10000.png}
+        \caption{\footnotesize 反应主导}
+        \label{fig:2loss_react10000}
+    \end{subfigure}
+    \caption{\footnotesize 不同参数下的loss下降曲线 ($\lambda_b=10000$)}
+    \label{fig:2losses10000}
+\end{figure}
+可以看到所有情况下都得到了很好的收敛，甚至最终loss函数的数量级到达了1e-7的程度，这相比于使用正态分布进行神经网络参数初始化的收敛性，提升十分明显。
+\section{总结}
+我们使用PINN网络对不同参数的给定方程进行了求解，得出了使用正态分布初始化的神经网络学习该方程的解的一系列过程，最后我们成功构建了求解复杂PDE的PINN模型，验证了不同物理参数对解的影响，掌握了超参数调整对边界条件满足的重要性，并且发现改变不同的初始化分布对神经网络的训练可能会有显著的效果。
+\end{document}
+
+

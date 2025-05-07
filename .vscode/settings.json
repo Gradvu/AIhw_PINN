@@ -1,0 +1,31 @@
+{
+    // ===== 核心Python配置 =====
+    "python.pythonPath": "~/ENTER/envs/pytorch_cuda12_env/bin/python", // Conda环境路径
+    "python.linting.enabled": true,
+    "python.linting.pylintEnabled": true,
+    "python.analysis.typeCheckingMode": "basic",
+  
+    // ===== 格式化配置（解决报错关键）=====
+    "python.formatting.provider": "black", // 或 "yapf"
+    "[python]": {
+      "editor.defaultFormatter": "ms-python.python", // 必须为官方扩展ID
+      "editor.formatOnSave": true,
+    },
+  
+    // ===== 终端配置 =====
+    "terminal.integrated.inheritEnv": false, // 解决Conda环境冲突
+  
+    // ===== Jupyter配置 =====
+    "jupyter.jupyterServerType": "local",
+  
+    // ===== 文件排除 =====
+    "files.exclude": {
+      "**/__pycache__": true,
+      "**/.DS_Store": true,
+      "**/*.ipynb_checkpoints": true
+    },
+    "files.watcherExclude": {
+      "**/.git/objects/**": true,
+      "**/data/**": true
+    }
+  }
